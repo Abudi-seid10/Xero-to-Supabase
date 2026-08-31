@@ -1,0 +1,33 @@
+{
+  "name": "xero-supabase-sync",
+  "version": "1.0.0",
+  "description": "Read-only sync of Xero Contacts, Invoices, Bills and Credit Notes into Supabase.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/sync.ts",
+  "keywords": [
+    "xero",
+    "supabase",
+    "sync",
+    "accounting",
+    "oauth2",
+    "postgres"
+  ],
+  "scripts": {
+    "setup-auth": "tsx src/setup-auth.ts",
+    "sync": "tsx src/sync.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "open": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}
+
