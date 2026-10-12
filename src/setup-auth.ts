@@ -33,6 +33,7 @@ const SCOPES = [
   "offline_access", // required to receive a refresh token
   "accounting.contacts.read",
   "accounting.invoices.read",
+  "accounting.attachments.read", // download invoice/bill/credit note files for the Frappe export
 ].join(" ");
 
 const state = randomBytes(16).toString("hex");

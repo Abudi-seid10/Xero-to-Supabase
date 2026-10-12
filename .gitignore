@@ -36,3 +36,9 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Exported financial data (Frappe import files + attachments)
+export/
+
+# QuickBooks rotating token store
+.qbo-auth.json
