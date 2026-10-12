@@ -304,3 +304,48 @@ export async function fetchAllPages<T>(
 
   return all;
 }
+
+interface RawRequestOptions {
+  accessToken: string;
+  tenantId: string;
+  accept?: string;
+}
+
+/**
+ * GET any Accounting API path (e.g. "Invoices/<id>/Attachments") and return the
+ * raw Response. Retries on 429, but refuses to sleep through a daily-limit lockout.
+ */
+export async function xeroGetRaw(path: string, opts: RawRequestOptions, maxRetries = 5): Promise<Response> {
+  const url = `${API_BASE}/${path}`;
+  const headers = {
+    Authorization: `Bearer ${opts.accessToken}`,
+    "Xero-tenant-id": opts.tenantId,
+    Accept: opts.accept ?? "application/json",
+  };
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, { headers });
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get("Retry-After") ?? "5");
+      const problem = res.headers.get("X-Rate-Limit-Problem") ?? "unknown limit";
+      if (retryAfter > 300) {
+        throw new Error(
+          `Xero ${problem} rate limit hit on ${path}; Retry-After is ${retryAfter}s. ` +
+            `Re-run the export later — files already downloaded are skipped.`
+        );
+      }
+      console.warn(`Rate limited on ${path} — waiting ${retryAfter}s (${problem})`);
+      await sleep((retryAfter + 1) * 1000);
+      continue;
+    }
+    if (res.status === 401 && path.includes("/Attachments")) {
+      throw new Error(
+        `Xero refused access to ${path} (401). The stored token was authorised before the ` +
+          `accounting.attachments.read scope was added — run \`npm run setup-auth\` and approve every organisation again.`
+      );
+    }
+    if (!res.ok) throw new Error(`Xero API error on ${path} (${res.status}): ${await res.text()}`);
+    return res;
+  }
+  throw new Error(`Exceeded retry budget fetching ${path}`);
+}

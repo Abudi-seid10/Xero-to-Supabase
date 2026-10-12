@@ -128,6 +128,65 @@ it forms the primary key, so data from different organisations remains separate.
 Every row also stores the full original Xero record in a `raw jsonb` column, so
 you're never blocked by a field the flattened columns didn't anticipate.
 
+## Export to Frappe / ERPNext
+
+Turns the data already synced into Supabase into Frappe **Data Import** CSVs, and
+downloads every invoice, bill and credit note attachment from Xero (GET only).
+
+```bash
+npm run sync                                   # make sure Supabase is current
+npm run export:frappe -- --tenant "My Org"     # one organisation per Frappe company
+```
+
+Set `FRAPPE_COMPANY` (and optionally the groups, tax accounts and account map) in
+`.env` first. Output goes to `export/<organisation>/` (git-ignored); choose another
+folder with `--out "D:\Frappe\xero"` or `EXPORT_DIR` in `.env`:
+
+| File | Frappe DocType | Notes |
+|---|---|---|
+| `customers.csv` / `suppliers.csv` | Customer / Supplier | Contacts used on sales docs become Customers, on bills Suppliers |
+| `contacts.csv` | Contact | Email/phone, linked to the Customer/Supplier |
+| `sales_invoices.csv` | Sales Invoice | ACCREC invoices **and** ACCRECCREDIT credit notes (`Is Return`) |
+| `purchase_invoices.csv` | Purchase Invoice | ACCPAY bills **and** ACCPAYCREDIT credit notes |
+| `attachments/` + `attachments_manifest.csv` | File | Downloaded originals |
+
+Import order in Frappe (**Data Import**, type *Insert New Records*): Customers,
+Suppliers, Contacts, Sales Invoices, Purchase Invoices. Leave "Submit After
+Import" off until you have spot-checked the drafts.
+
+**Line items** are one child row each (`Items` table). `Rate` is the net line
+amount divided by quantity, so discounts and tax-inclusive lines match Xero's
+totals. Tax is exported as one `Actual` tax row per document equal to Xero's
+`TotalTax`; set `FRAPPE_SALES_TAX_ACCOUNT` / `FRAPPE_PURCHASE_TAX_ACCOUNT`.
+Xero account codes are only carried over if you provide `FRAPPE_ACCOUNT_MAP_FILE`.
+
+**Attachments** cannot be bulk-imported by Data Import. After the documents exist,
+upload them (needs a Frappe API key/secret in `.env`):
+
+```bash
+npm run upload:attachments -- export/MyOrg
+```
+
+Each exported document has `XERO:<id>` in its Remarks; the uploader uses it to find
+the right document, and is safe to re-run. The export is also resumable: files
+already on disk are skipped, which matters because Xero allows 5,000 calls/day per
+organisation and each attachment costs a call (the script paces itself to ~55/min).
+
+**Not exported:** Documents with status `DELETED`/`VOIDED`, payments/allocations, Xero
+inventory items (lines are free-text with no Item Code), and contact-level
+attachments. Frappe column labels vary slightly by version; Data Import's column
+mapping step lets you re-map any that differ.
+
+### QuickBooks Online
+
+`npm run export:qbo -- --out "D:\Frappe\qb"` exports a QuickBooks company straight to the same
+Frappe CSVs and attachments (no Supabase). Set `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`,
+`QBO_REALM_ID`, `QBO_ENVIRONMENT` and a seed `QBO_REFRESH_TOKEN` (from the Intuit OAuth
+Playground, issued for the same app and environment) in `.env`. QuickBooks rotates the
+refresh token on every use, so the current one is kept in the git-ignored `.qbo-auth.json`;
+it is ignored automatically if you change the client ID or seed token. Documents carry a
+`QBO:<type>-<id>#` marker in Remarks so `upload:attachments` works for them too.
+
 ## Extending
 
 - **More resources** (Payments, Purchase Orders, Bank Transactions, etc.): add

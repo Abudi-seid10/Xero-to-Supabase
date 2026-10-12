@@ -2,7 +2,7 @@
 // far more commonly, as ".NET JSON dates" like "/Date(1706572800000+0000)/".
 // This normalises both into a plain "YYYY-MM-DD" string for Postgres `date`
 // columns, or null if absent.
-function toDateOnly(value: unknown): string | null {
+export function toDateOnly(value: unknown): string | null {
   if (!value || typeof value !== "string") return null;
   const match = value.match(/\/Date\((\d+)/);
   const ms = match ? Number(match[1]) : Date.parse(value);
