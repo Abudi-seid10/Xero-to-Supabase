@@ -8,7 +8,8 @@
 import "dotenv/config";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { qboCompanyName, qboFetch, qboQueryAll } from "./qbo.js";
+import { currentRealm, discoverRealms, qboCompanyName, qboFetch, qboQueryAll, useRealm } from "./qbo.js";
+import { API_BASE } from "./qbo-env.js";
 import { writeCsv, type CsvRow } from "./csv.js";
 import { loadFrappeConfig, writeFrappeFiles } from "./frappe-writer.js";
 import { isSalesDoc, type XeroContactRaw, type XeroDocRaw } from "./frappe-mappers.js";
@@ -122,9 +123,27 @@ function docOf(d: Q, type: "ACCREC" | "ACCRECCREDIT" | "ACCPAY" | "ACCPAYCREDIT"
 
 interface QboDoc { entity: string; id: string; doc: XeroDocRaw }
 
-async function downloadAttachments(outDir: string, docs: QboDoc[]): Promise<CsvRow[]> {
+/**
+ * TempDownloadUri links expire after ~15 minutes, far less than a large export takes, so ask for
+ * a fresh signed link per file. The listing's own link is only a fallback.
+ */
+async function freshDownloadUrl(att: Q): Promise<string> {
+  try {
+    const res = await qboFetch(`${API_BASE}/v3/company/${currentRealm()}/download/${att.Id}?minorversion=75`, {
+      headers: { Accept: "application/octet-stream, text/plain, */*" },
+    });
+    const url = (await res.text()).trim().replace(/^"|"$/g, "");
+    if (/^https:\/\//.test(url)) return url;
+  } catch {
+    /* fall through to the listing link */
+  }
+  return att.TempDownloadUri;
+}
+
+/** Appends to `manifest` as it goes, so a partial run still leaves a usable manifest. */
+async function downloadAttachments(outDir: string, docs: QboDoc[], manifest: CsvRow[]): Promise<void> {
   const byRef = new Map(docs.map((d) => [`${d.entity}:${d.id}`, d]));
-  const manifest: CsvRow[] = [];
+  const failures: string[] = [];
   const used = new Map<string, Set<string>>();
 
   const attachables = await qboQueryAll<Q>("Attachable");
@@ -153,10 +172,15 @@ async function downloadAttachments(outDir: string, docs: QboDoc[]): Promise<CsvR
 
       const existing = await stat(abs).catch(() => null);
       if (!existing || (att.Size && existing.size !== Number(att.Size))) {
-        // TempDownloadUri is a pre-signed URL: no Authorization header.
-        bytes ??= Buffer.from(await (await qboFetch(att.TempDownloadUri, { headers: { Accept: "*/*" } }, false)).arrayBuffer());
-        await mkdir(path.join(outDir, dir), { recursive: true });
-        await writeFile(abs, bytes);
+        try {
+          // The signed link needs no Authorization header.
+          bytes ??= Buffer.from(await (await qboFetch(await freshDownloadUrl(att), { headers: { Accept: "*/*" } }, false)).arrayBuffer());
+          await mkdir(path.join(outDir, dir), { recursive: true });
+          await writeFile(abs, bytes);
+        } catch (err) {
+          failures.push(`${number}/${att.FileName}: ${err instanceof Error ? err.message.slice(0, 160) : err}`);
+          continue; // keep going; re-running retries only the missing files
+        }
       }
       manifest.push({
         doctype: isSalesDoc(t.doc) ? "Sales Invoice" : "Purchase Invoice",
@@ -168,18 +192,19 @@ async function downloadAttachments(outDir: string, docs: QboDoc[]): Promise<CsvR
     }
     if (++n % 25 === 0) console.log(`    ${n} files processed`);
   }
-  return manifest;
+  if (failures.length) {
+    console.warn(`  ${failures.length} attachment(s) could not be downloaded (re-run to retry just those):`);
+    for (const f of failures.slice(0, 10)) console.warn(`    - ${f}`);
+    if (failures.length > 10) console.warn(`    ...and ${failures.length - 10} more`);
+  }
 }
 
 // ------------------------------------------------------------------ main
 
-async function main() {
-  const args = process.argv.slice(2);
-  const outArg = args.includes("--out") ? args[args.indexOf("--out") + 1] : undefined;
-  const baseDir = outArg || process.env.EXPORT_DIR || "export";
-  const skipAttachments = args.includes("--skip-attachments");
-
+async function exportCompany(baseDir: string, skipAttachments: boolean, multiple: boolean) {
   const company = await qboCompanyName();
+  // With several companies one FRAPPE_COMPANY would mislabel all but one, so use each QuickBooks name.
+  if (multiple) delete process.env.FRAPPE_COMPANY;
   const cfg = await loadFrappeConfig(company);
   const outDir = path.join(baseDir, safe(company));
   console.log(`Exporting QuickBooks company "${company}" -> ${outDir}`);
@@ -211,12 +236,47 @@ async function main() {
   if (skipAttachments) return;
   const manifest: CsvRow[] = [];
   try {
-    manifest.push(...(await downloadAttachments(outDir, all)));
+    await downloadAttachments(outDir, all, manifest);
   } finally {
     await writeCsv(path.join(outDir, "attachments_manifest.csv"), ATTACHMENT_HEADERS, manifest);
     console.log(`  Attachment manifest: ${manifest.length} file(s).`);
   }
-  console.log("\nExport complete.");
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const arg = (name: string) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+  const baseDir = arg("--out") || process.env.EXPORT_DIR || "export";
+  const skipAttachments = args.includes("--skip-attachments");
+  const only = arg("--realm");
+
+  const realms = only ? [only] : await discoverRealms();
+  if (!realms.length) throw new Error("No QuickBooks company configured. Run `npm run setup-qbo-auth` or set QBO_REALM_ID.");
+  console.log(`QuickBooks companies to export: ${realms.length} (${realms.join(", ")})`);
+  if (realms.length > 1 && process.env.FRAPPE_COMPANY) {
+    console.warn("FRAPPE_COMPANY is ignored when exporting several companies; each uses its QuickBooks company name.");
+  }
+
+  const failed: string[] = [];
+  for (const realm of realms) {
+    console.log(`
+=== Company ${realm} ===`);
+    useRealm(realm);
+    try {
+      await exportCompany(baseDir, skipAttachments, realms.length > 1);
+    } catch (err) {
+      // One company failing (expired token, wrong environment) must not stop the others.
+      console.error(`Company ${realm} failed:`, err instanceof Error ? err.message : err);
+      failed.push(realm);
+    }
+  }
+
+  console.log(`
+Export finished: ${realms.length - failed.length}/${realms.length} company(ies) succeeded.`);
+  if (failed.length) {
+    console.error(`Failed: ${failed.join(", ")}. Re-run npm run setup-qbo-auth for those, or retry with --realm <id>.`);
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {

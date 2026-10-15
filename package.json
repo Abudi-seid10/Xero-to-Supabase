@@ -17,6 +17,7 @@
     "setup-auth": "tsx src/setup-auth.ts",
     "sync": "tsx src/sync.ts",
     "export:frappe": "tsx src/export-frappe.ts",
+    "setup-qbo-auth": "tsx src/setup-qbo-auth.ts",
     "export:qbo": "tsx src/export-qbo.ts",
     "upload:attachments": "tsx src/upload-frappe-attachments.ts",
     "build": "tsc",

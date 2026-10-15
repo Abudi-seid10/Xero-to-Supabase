@@ -1,23 +1,37 @@
 /** Minimal read-only QuickBooks Online client: token refresh + paged queries. */
-import "dotenv/config";
-import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
+import {
+  API_BASE, TOKEN_URL, basicAuth, fingerprint, readTokenFile, requireEnv, writeTokenFile,
+} from "./qbo-env.js";
 
-const TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
-const TOKEN_FILE = ".qbo-auth.json";
 const MINOR_VERSION = "75";
-
-function requireEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing required env var: ${name}`);
-  return v;
-}
 
 const CLIENT_ID = requireEnv("QBO_CLIENT_ID");
 const CLIENT_SECRET = requireEnv("QBO_CLIENT_SECRET");
-export const REALM_ID = requireEnv("QBO_REALM_ID");
-const API_BASE =
-  process.env.QBO_ENVIRONMENT === "sandbox" ? "https://sandbox-quickbooks.api.intuit.com" : "https://quickbooks.api.intuit.com";
+
+// The company all calls go to. Switch with useRealm(); each switch drops the cached access token.
+let realmId = process.env.QBO_REALM_ID ?? "";
+export const currentRealm = (): string => realmId;
+export function useRealm(id: string): void {
+  realmId = id;
+  accessToken = "";
+}
+
+/**
+ * Companies to export: QBO_REALM_ID plus every company connected with this client ID
+ * (one .qbo-auth-<companyId>.json per company, created by `npm run setup-qbo-auth`).
+ */
+export async function discoverRealms(): Promise<string[]> {
+  const found = new Set<string>();
+  if (process.env.QBO_REALM_ID) found.add(process.env.QBO_REALM_ID);
+  for (const name of await readdir(".")) {
+    const m = /^\.qbo-auth-(\d+)\.json$/.exec(name);
+    if (!m) continue;
+    const saved = await readTokenFile(m[1]);
+    if (saved?.client === fingerprint(CLIENT_ID)) found.add(m[1]);
+  }
+  return [...found];
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -25,21 +39,22 @@ let accessToken = "";
 let tokenAt = 0;
 
 /**
- * QuickBooks rotates the refresh token on use, so the newest one is kept in .qbo-auth.json.
- * The saved token is only trusted while the client ID and the seed token in .env are unchanged;
- * pasting new keys or a new QBO_REFRESH_TOKEN therefore takes effect without deleting the file.
+ * QuickBooks rotates the refresh token on use, so the newest one is kept on disk per company.
+ * A saved token is trusted while the client ID is unchanged and it either came from
+ * `npm run setup-qbo-auth` or grew from the current QBO_REFRESH_TOKEN seed; pasting a new seed
+ * therefore takes effect without deleting the file.
  */
-const fingerprint = (v: string) => createHash("sha256").update(v).digest("hex").slice(0, 16);
-
 async function currentRefreshToken(): Promise<string> {
-  const seed = requireEnv("QBO_REFRESH_TOKEN");
-  try {
-    const saved = JSON.parse(await readFile(TOKEN_FILE, "utf8")) as { refresh_token?: string; client?: string; seed?: string };
-    if (saved.refresh_token && saved.client === fingerprint(CLIENT_ID) && saved.seed === fingerprint(seed)) {
-      return saved.refresh_token;
-    }
-  } catch {
-    /* first run */
+  const saved = await readTokenFile(realmId);
+  // The QBO_REFRESH_TOKEN seed belongs to QBO_REALM_ID only, never to other discovered companies.
+  const isEnvRealm = realmId === process.env.QBO_REALM_ID;
+  const seed = isEnvRealm ? process.env.QBO_REFRESH_TOKEN : undefined;
+  if (saved?.refresh_token && saved.client === fingerprint(CLIENT_ID)) {
+    // For the .env company a changed seed means new tokens were pasted, so prefer them.
+    if (!isEnvRealm || saved.seed === "oauth" || (seed && saved.seed === fingerprint(seed))) return saved.refresh_token;
+  }
+  if (!seed) {
+    throw new Error(`No QuickBooks token for company ${realmId}. Run \`npm run setup-qbo-auth\` or set QBO_REFRESH_TOKEN.`);
   }
   return seed;
 }
@@ -50,24 +65,26 @@ async function refresh(): Promise<void> {
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
-      Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+      Authorization: basicAuth(CLIENT_ID, CLIENT_SECRET),
     },
     body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: await currentRefreshToken() }),
   });
   if (!res.ok) {
     throw new Error(
       `QuickBooks token refresh failed (${res.status}): ${await res.text()}. ` +
-        `If the refresh token expired or was already rotated, generate a new one in the Intuit OAuth Playground, ` +
-        `put it in QBO_REFRESH_TOKEN (it must come from the same app/client ID and environment as QBO_CLIENT_ID).`
+        `If the refresh token expired or was already rotated, ` +
+        "run 'npm run setup-qbo-auth' again (the token must come from the same app/client ID and environment as QBO_CLIENT_ID)."
     );
   }
   const json = (await res.json()) as { access_token: string; refresh_token: string };
-  await writeFile(TOKEN_FILE, JSON.stringify({
-      refresh_token: json.refresh_token,
-      client: fingerprint(CLIENT_ID),
-      seed: fingerprint(requireEnv("QBO_REFRESH_TOKEN")),
-      updated_at: new Date().toISOString(),
-    }), "utf8");
+  const saved = await readTokenFile(realmId);
+  const seed = realmId === process.env.QBO_REALM_ID ? process.env.QBO_REFRESH_TOKEN : undefined;
+  // Keep the existing provenance marker so the next run still trusts the rotated token.
+  const sameClient = saved?.client === fingerprint(CLIENT_ID);
+  const marker = sameClient && saved?.seed && (saved.seed === "oauth" || realmId !== process.env.QBO_REALM_ID)
+    ? saved.seed
+    : fingerprint(seed ?? "");
+  await writeTokenFile(realmId, CLIENT_ID, json.refresh_token, marker);
   accessToken = json.access_token;
   tokenAt = Date.now();
 }
@@ -98,7 +115,7 @@ export async function qboQueryAll<T>(entity: string): Promise<T[]> {
   const out: T[] = [];
   for (let start = 1; ; start += 1000) {
     const q = `SELECT * FROM ${entity} ORDERBY Id STARTPOSITION ${start} MAXRESULTS 1000`;
-    const res = await qboFetch(`${API_BASE}/v3/company/${REALM_ID}/query?minorversion=${MINOR_VERSION}&query=${encodeURIComponent(q)}`);
+    const res = await qboFetch(`${API_BASE}/v3/company/${realmId}/query?minorversion=${MINOR_VERSION}&query=${encodeURIComponent(q)}`);
     const rows = ((await res.json()) as { QueryResponse?: Record<string, T[]> }).QueryResponse?.[entity] ?? [];
     out.push(...rows);
     if (rows.length < 1000) break;
@@ -107,6 +124,6 @@ export async function qboQueryAll<T>(entity: string): Promise<T[]> {
 }
 
 export async function qboCompanyName(): Promise<string> {
-  const res = await qboFetch(`${API_BASE}/v3/company/${REALM_ID}/companyinfo/${REALM_ID}?minorversion=${MINOR_VERSION}`);
-  return ((await res.json()) as { CompanyInfo?: { CompanyName?: string } }).CompanyInfo?.CompanyName ?? `QuickBooks ${REALM_ID}`;
+  const res = await qboFetch(`${API_BASE}/v3/company/${realmId}/companyinfo/${realmId}?minorversion=${MINOR_VERSION}`);
+  return ((await res.json()) as { CompanyInfo?: { CompanyName?: string } }).CompanyInfo?.CompanyName ?? `QuickBooks ${realmId}`;
 }
